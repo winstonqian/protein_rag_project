@@ -8,6 +8,7 @@ import sys
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer, AutoModel
+from collections import defaultdict
 
 
 def extract_features(dataset, split_name, feature_dir="features"):
@@ -44,7 +45,6 @@ def extract_features(dataset, split_name, feature_dir="features"):
 
 
 def score_to_confidence(score):
-    # 将分数转为置信度，大于90为High Confindence, 60到90为Medium Confidence, 60以下为Low Confidence
     if score >= 90:
         return "<High Confidence>"
     elif score >= 60:
@@ -54,7 +54,6 @@ def score_to_confidence(score):
     
 
 def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_insts, test_seqs, test_labels, test_metas, task_name, topk, faiss_index):
-    
     # --- Faiss 检索 (HNSW Index) ---
     if faiss_index is None:
         d = db_features.shape[1]
@@ -62,29 +61,23 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
         db_features_norm = db_features / np.linalg.norm(db_features, axis=1, keepdims=True)
         faiss_index.add(db_features_norm.astype(np.float32))
         faiss_index.hnsw.efSearch = max(50, topk * 2)
-    
+
     test_features = np.load(f"{task_name}_test_features.npy")
     test_features_norm = test_features / np.linalg.norm(test_features, axis=1, keepdims=True)
     st_time = time.time()
     D, I = faiss_index.search(test_features_norm.astype(np.float32), topk)
     print(f"Faiss HNSW search time: {time.time() - st_time:.4f} seconds")
-    
+
     faiss_results = []
     for i, (idxs, scores) in enumerate(zip(I, D)):
         faiss_topk = []
         for idx, score in zip(idxs, scores):
             faiss_topk.append({
-                # "db_seq": db_seqs[idx],
                 "db_label": db_labels[idx],
                 "score": score 
             })
         faiss_results.append(faiss_topk)
 
-    # print(f"Faiss Top{topk} results for first test sample:")
-    # for item in faiss_results[0]:
-    #     print(item)
-
-    # --- MMSeqs2 检索 (os.system模拟命令行) ---
     with tempfile.TemporaryDirectory() as tmpdir:
         db_fasta = os.path.join(tmpdir, "db.fasta")
         query_fasta = os.path.join(tmpdir, "query.fasta")
@@ -114,6 +107,8 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
                     "score": float(pident)
                 })
 
+    alpha = 0.5
+
     train_features = np.load(f"{task_name}_train_features.npy")
     train_features_norm = train_features / np.linalg.norm(train_features, axis=1, keepdims=True)
     train_faiss_index = faiss.IndexHNSWFlat(train_features_norm.shape[1], 32)
@@ -132,26 +127,35 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
     
     output_json = []
     for i in range(len(test_insts)):
-        combined_results = []
-        # Add Faiss results
+        score_dict = {}
         for item in faiss_results[i]:
-            combined_results.append({
-            "db_label": item["db_label"],
-            "score": item["score"],
-            })
-        # Add MMSeqs2 results
+            score_dict[item["db_label"]] = {"faiss": item["score"], "mmseqs": None}
         for item in mmseqs_results[i]:
+            if item["db_label"] in score_dict:
+                score_dict[item["db_label"]]["mmseqs"] = item["score"]
+            else:
+                score_dict[item["db_label"]] = {"faiss": None, "mmseqs": item["score"]}
+        combined_results = []
+        for db_label, scores in score_dict.items():
+            faiss_score = scores["faiss"] if scores["faiss"] is not None else 0.0
+            mmseqs_score = scores["mmseqs"] if scores["mmseqs"] is not None else 0.0
+            if faiss_score == 0.0 and mmseqs_score == 0.0:
+                continue
+            final_score = alpha * faiss_score + (1 - alpha) * mmseqs_score
             combined_results.append({
-            "db_label": item["db_label"],
-            "score": item["score"],
+                "db_label": db_label,
+                "score": final_score,
+                "faiss_score": faiss_score,
+                "mmseqs_score": mmseqs_score
             })
-        # Sort by score descending, take topk
         combined_results_sorted = sorted(combined_results, key=lambda x: x["score"], reverse=True)[:topk]
         retrieved_info = []
         for item in combined_results_sorted:
             retrieved_info.append({
-            "db_label": item["db_label"],
-            "confidence level": score_to_confidence(item["score"]),
+                "db_label": item["db_label"],
+                "confidence level": score_to_confidence(item["score"]),
+                "faiss_score": item["faiss_score"],
+                "mmseqs_score": item["mmseqs_score"]
             })
         train_examples = []
         for item in train_faiss_results[i]:
@@ -165,16 +169,16 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
             "labels": test_labels[i],
             "meta_label": test_metas[i],
             "RAG_prompt": (
-                f"You are given a protein sequence and two lists of related proteins retrieved from a database.\n"
+                f"You are given a protein sequence and a list of related proteins retrieved from a database.\n"
                 f"Instruction: {test_insts[i]}\n"
                 f"Protein sequence: {test_seqs[i]}\n"
-                f"Retrieved proteins annotations by Faiss and MMSeqs2: {retrieved_info}\n"
+                f"Retrieved proteins annotations by weighted Faiss/MMSeqs2: {retrieved_info}\n"
                 f"Here are some example input-output pairs for this task:\n"
                 f"{train_examples}\n"
                 "Based on the instruction, the protein sequence, the retrieved information, and the examples, "
                 "output ONLY the functional description of this protein in the following JSON format:\n"
-                "{\"description\": \"...\"}\n"
-                "Do not output any other text or explanation. Only output the JSON answer."
+                '{"description": "..."}'
+                "\nDo not output any other text or explanation. Only output the JSON answer."
             )
         }
         output_json.append(rag_prompt)
@@ -229,9 +233,27 @@ if __name__ == "__main__":
         all_train_seqs.extend(now_train_seqs)
         all_train_labels.extend(now_train_labels)
         all_train_features.extend(now_train_feature)
-        
-    all_train_features = np.array(all_train_features)
-        
+    
+    # print(f"Total training samples before aggregation: {len(all_train_labels)}")
+    # Feature Aggregation
+    label_to_features = defaultdict(list)
+    for feat, label in zip(all_train_features, all_train_labels):
+        label_to_features[label].append(feat)
+
+    new_all_train_features = []
+    new_all_train_labels = []
+    for label, feats in label_to_features.items():
+        if len(feats) == 1: continue
+        feats = np.stack(feats)
+        mean_feat = feats.mean(axis=0)
+        new_all_train_features.append(mean_feat)
+        new_all_train_labels.append(label)
+    
+    all_train_features = np.vstack([np.array(all_train_features), np.array(new_all_train_features)])
+    all_train_labels = all_train_labels + new_all_train_labels
+    
+    # print(f"Total training samples after aggregation: {len(all_train_labels)}")
+    
     for p in os.listdir(dataset_path):
         now_task = p[:-5]
         print(f"=== Task: {now_task} ===")
