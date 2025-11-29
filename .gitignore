@@ -181,3 +181,18 @@ dataset/protein_function_OOD.json
 
 # features
 retrival_methods/features/
+
+# Generated Feature Files
+*.npy
+features/
+
+# Generated Prompt Files
+*_RAP_Top_*.json
+
+# Inference Results
+RAPM_*_results.json
+api_evaluation_results.txt
+all_results.txt
+
+# System Files
+.DS_Store

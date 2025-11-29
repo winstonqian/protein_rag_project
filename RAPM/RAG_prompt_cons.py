@@ -1,3 +1,4 @@
+import argparse
 import os
 import json
 import time
@@ -9,6 +10,9 @@ from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer, AutoModel
 from collections import defaultdict
+import random
+
+ENTITY_MASK_TOKEN = "[MASKED_ENTITY]"
 
 
 def extract_features(dataset, split_name, feature_dir="features"):
@@ -53,7 +57,7 @@ def score_to_confidence(score):
         return "<Low Confidence>"
     
 
-def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_insts, test_seqs, test_labels, test_metas, task_name, topk, faiss_index):
+def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_insts, test_seqs, test_labels, test_metas, task_name, topk, faiss_index, context_mode="normal"):
     # --- Faiss 检索 (HNSW Index) ---
     if faiss_index is None:
         d = db_features.shape[1]
@@ -74,7 +78,8 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
         for idx, score in zip(idxs, scores):
             faiss_topk.append({
                 "db_label": db_labels[idx],
-                "score": score 
+                "score": float(score),
+                "id": int(idx)
             })
         faiss_results.append(faiss_topk)
 
@@ -104,7 +109,8 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
                 tidx = int(tid.replace("db_", ""))
                 mmseqs_results[qidx].append({
                     "db_label": db_labels[tidx],
-                    "score": float(pident)
+                    "score": float(pident),
+                    "id": int(tidx)
                 })
 
     alpha = 0.5
@@ -129,12 +135,12 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
     for i in range(len(test_insts)):
         score_dict = {}
         for item in faiss_results[i]:
-            score_dict[item["db_label"]] = {"faiss": item["score"], "mmseqs": None}
+            score_dict[item["db_label"]] = {"faiss": item["score"], "mmseqs": None, "id": item.get("id")}
         for item in mmseqs_results[i]:
             if item["db_label"] in score_dict:
                 score_dict[item["db_label"]]["mmseqs"] = item["score"]
             else:
-                score_dict[item["db_label"]] = {"faiss": None, "mmseqs": item["score"]}
+                score_dict[item["db_label"]] = {"faiss": None, "mmseqs": item["score"], "id": item.get("id")}
         combined_results = []
         for db_label, scores in score_dict.items():
             faiss_score = scores["faiss"] if scores["faiss"] is not None else 0.0
@@ -144,9 +150,10 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
             final_score = alpha * faiss_score + (1 - alpha) * mmseqs_score
             combined_results.append({
                 "db_label": db_label,
-                "score": final_score,
-                "faiss_score": faiss_score,
-                "mmseqs_score": mmseqs_score
+                "score": float(final_score),
+                "faiss_score": float(faiss_score),
+                "mmseqs_score": float(mmseqs_score),
+                "id": scores.get("id")
             })
         combined_results_sorted = sorted(combined_results, key=lambda x: x["score"], reverse=True)[:topk]
         retrieved_info = []
@@ -155,8 +162,20 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
                 "db_label": item["db_label"],
                 "confidence level": score_to_confidence(item["score"]),
                 "faiss_score": item["faiss_score"],
-                "mmseqs_score": item["mmseqs_score"]
+                "mmseqs_score": item["mmseqs_score"],
+                "id": item["id"]
             })
+        
+        contexts = build_contexts_with_mode(retrieved_info, context_mode, test_metas[i])
+
+        removed_passages = []
+        if context_mode == "mask_top1" and len(retrieved_info) > 0:
+            removed_passages = [retrieved_info[0]]
+        elif context_mode == "mask_entities":
+            for orig, new_p in zip(retrieved_info, contexts):
+                if orig['db_label'] != new_p['db_label']:
+                    removed_passages.append(orig)
+
         train_examples = []
         for item in train_faiss_results[i]:
             train_examples.append({
@@ -172,29 +191,84 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
                 f"You are given a protein sequence and a list of related proteins retrieved from a database.\n"
                 f"Instruction: {test_insts[i]}\n"
                 f"Protein sequence: {test_seqs[i]}\n"
-                f"Retrieved proteins annotations by weighted Faiss/MMSeqs2: {retrieved_info}\n"
+                f"Retrieved proteins annotations by weighted Faiss/MMSeqs2: {contexts}\n"
                 f"Here are some example input-output pairs for this task:\n"
                 f"{train_examples}\n"
                 "Based on the instruction, the protein sequence, the retrieved information, and the examples, "
                 "output ONLY the functional description of this protein in the following JSON format:\n"
                 '{"description": "..."}'
                 "\nDo not output any other text or explanation. Only output the JSON answer."
-            )
+            ),
+            "context_mode": context_mode,
+            "removed_passages": removed_passages
         }
         output_json.append(rag_prompt)
 
-    with open(f"{task_name}_RAP_Top_{topk}.json", "w", encoding="utf-8") as f:
+    with open(f"{task_name}_RAP_Top_{topk}_{context_mode}.json", "w", encoding="utf-8") as f:
         json.dump(output_json, f, ensure_ascii=False, indent=2)
 
 
 
+def mask_key_entities(text: str, metadata) -> str:
+    """
+    Replace occurrences of gold entities with a mask token.
+    """
+    entities = []
+    if isinstance(metadata, dict):
+        entities = metadata.get("bio_entity", [])
+    elif isinstance(metadata, str):
+        if len(metadata) < 100:
+             entities = [metadata]
+    
+    masked = text
+    for ent in entities:
+        if not ent:
+            continue
+        masked = masked.replace(ent, ENTITY_MASK_TOKEN)
+    return masked
+
+def build_contexts_with_mode(retrieved_passages, mode, current_sample_metadata=None, rng=None):
+    """
+    retrieved_passages: list[dict] (retrieved_info)
+    mode: str
+    current_sample_metadata: dict or str
+    """
+    if rng is None:
+        rng = random.Random(0)
+
+    if mode == "normal":
+        return retrieved_passages
+
+    if mode == "mask_top1":
+        if len(retrieved_passages) > 0:
+            return retrieved_passages[1:]
+        return retrieved_passages
+
+    if mode == "mask_entities":
+        masked_passages = []
+        for p in retrieved_passages:
+            new_p = p.copy()
+            new_p["db_label"] = mask_key_entities(p["db_label"], current_sample_metadata)
+            masked_passages.append(new_p)
+        return masked_passages
+
+    return retrieved_passages
+
+
 if __name__ == "__main__":
     
-    if len(sys.argv) < 3:
-        print("Usage: python RAG_prompt_cons.py <dataset_path> <top_k>")
-        sys.exit(1)
-    dataset_path = sys.argv[1]
-    top_k = int(sys.argv[2])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dataset_path", type=str, help="Path to the dataset folder")
+    parser.add_argument("top_k", type=int, help="Top K retrieval")
+    parser.add_argument("--context_mode", type=str, default="normal", 
+                        choices=["normal", "mask_top1", "mask_entities", "decoy_replace", "decoy_distractor"],
+                        help="Context corruption mode")
+    parser.add_argument("--task_name", type=str, default=None, help="Specific task to process")
+    args = parser.parse_args()
+
+    dataset_path = args.dataset_path
+    top_k = args.top_k
+    context_mode = args.context_mode
     
     all_train_seqs = []
     all_train_labels = []
@@ -204,6 +278,7 @@ if __name__ == "__main__":
     # for now_task in tasks:
     for p in os.listdir(dataset_path):
         now_task = p[:-5]
+        if args.task_name and now_task != args.task_name: continue
         print(f"=== Task: {now_task} ===")
         if not p.endswith(".json"): continue
         JSON_PATH = os.path.join(dataset_path, p)
@@ -256,6 +331,7 @@ if __name__ == "__main__":
     
     for p in os.listdir(dataset_path):
         now_task = p[:-5]
+        if args.task_name and now_task != args.task_name: continue
         print(f"=== Task: {now_task} ===")
         JSON_PATH = os.path.join(dataset_path, p)
         dic = json.load(open(JSON_PATH, "r"))
@@ -277,4 +353,5 @@ if __name__ == "__main__":
                                 test_metas=now_test_meta,
                                 task_name=now_task,
                                 topk=top_k,
-                                faiss_index=None)
+                                faiss_index=None,
+                                context_mode=context_mode)

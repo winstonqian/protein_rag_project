@@ -3,6 +3,7 @@
 import json
 from tqdm import tqdm
 import random
+import argparse
 
 from openai import OpenAI
 from nltk.translate.bleu_score import corpus_bleu
@@ -23,8 +24,9 @@ def extract_words(text):
 
 def evaluation(lines, labels, meta_labels):
     
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=False)
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-1.3b", use_fast=False)
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     labels = [l.strip() for l in labels]
     lines = [line.strip() for line in lines]
     
@@ -137,8 +139,8 @@ def evaluation(lines, labels, meta_labels):
 
 
 client = OpenAI(
-    # api_key="your_api_key",
-    # base_url="your_base_url",
+    api_key="AIzaSyBD-_AkH8m-hr8OU-DCEXLsuG6uECRJD9g",
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
 )
 
 
@@ -174,23 +176,32 @@ def api_inference(RAG_prompt, model):
 
 if __name__ == "__main__":
 
-    now_task = sys.argv[1]
-    now_k = int(sys.argv[2])
-    model = "gpt-4.1"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("task_name", type=str, help="Task name")
+    parser.add_argument("k", type=int, help="Top K")
+    parser.add_argument("--context_mode", type=str, default="normal",
+                        choices=["normal", "mask_top1", "mask_entities", "decoy_replace", "decoy_distractor"],
+                        help="Context corruption mode")
+    args = parser.parse_args()
+
+    now_task = args.task_name
+    now_k = args.k
+    context_mode = args.context_mode
+    model = "gemini-2.5-flash"
     
-    result_file = open("api_evaluation_results.txt", "w")
+    result_file = open("api_evaluation_results.txt", "a+")
     all_input_prompt_len = 0
     infer_numbers = 256
     
-    print("now task: ", now_task, "now k: ", now_k)
-    print("now task: ", now_task, "now k: ", now_k, file=result_file)
-    JSON_PATH = f"{now_task}_RAP_Top_{now_k}.json"
+    print("now task: ", now_task, "now k: ", now_k, "context_mode: ", context_mode)
+    print("now task: ", now_task, "now k: ", now_k, "context_mode: ", context_mode, file=result_file)
+    JSON_PATH = f"{now_task}_RAP_Top_{now_k}_{context_mode}.json"
     dic = json.load(open(JSON_PATH, "r"))
     all_answers = []
     all_labels = []
     all_meta_labels = []
 
-    for i in tqdm(range(infer_numbers)):
+    for i in tqdm(range(len(dic))):
         d = dic[i]
         RAG_prompt = d['RAG_prompt']
         answer = d['labels']
@@ -204,7 +215,7 @@ if __name__ == "__main__":
         all_labels.append(answer)
         all_meta_labels.append(meta_answer)
 
-    print("Average input prompt length: ", all_input_prompt_len / infer_numbers)
+    print("Average input prompt length: ", all_input_prompt_len / len(dic))
     
     evaluation(all_answers, all_labels, all_meta_labels)
 
@@ -216,7 +227,7 @@ if __name__ == "__main__":
             "meta_label": all_meta_labels[i]
         }
 
-        with open(f"RAPM_{now_task}_{now_k}_results.json", 'a+') as f:
+        with open(f"RAPM_{now_task}_{now_k}_{context_mode}_results.json", 'a+') as f:
             json.dump(info_dict, f)
             f.write('\n')
 
