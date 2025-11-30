@@ -11,6 +11,10 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 from collections import defaultdict
 import random
+try:
+    from RAPM.decoy_utils import replace_entity_with_wrong_one, add_distractor_passage, sample_random_distractor
+except ImportError:
+    from decoy_utils import replace_entity_with_wrong_one, add_distractor_passage, sample_random_distractor
 
 ENTITY_MASK_TOKEN = "[MASKED_ENTITY]"
 
@@ -57,7 +61,7 @@ def score_to_confidence(score):
         return "<Low Confidence>"
     
 
-def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_insts, test_seqs, test_labels, test_metas, task_name, topk, faiss_index, context_mode="normal"):
+def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_insts, test_seqs, test_labels, test_metas, task_name, topk, faiss_index, context_mode="normal", global_entity_pool=None, distractor_db=None):
     # --- Faiss 检索 (HNSW Index) ---
     if faiss_index is None:
         d = db_features.shape[1]
@@ -166,7 +170,7 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
                 "id": item["id"]
             })
         
-        contexts = build_contexts_with_mode(retrieved_info, context_mode, test_metas[i])
+        contexts = build_contexts_with_mode(retrieved_info, context_mode, test_metas[i], global_entity_pool=global_entity_pool, distractor_db=distractor_db)
 
         removed_passages = []
         if context_mode == "mask_top1" and len(retrieved_info) > 0:
@@ -175,6 +179,17 @@ def RAG_prompt_construction(db_seqs, db_labels, db_features, train_labels, test_
             for orig, new_p in zip(retrieved_info, contexts):
                 if orig['db_label'] != new_p['db_label']:
                     removed_passages.append(orig)
+        elif context_mode == "decoy_replace":
+            # In decoy_replace, we modify the first passage.
+            # If the first passage is different, we log the original.
+            if len(retrieved_info) > 0 and len(contexts) > 0:
+                if retrieved_info[0]['db_label'] != contexts[0]['db_label']:
+                    removed_passages.append(retrieved_info[0])
+        elif context_mode == "decoy_distractor":
+            # In decoy_distractor, we add a passage.
+            # We don't remove anything, but we could log the added distractor if needed.
+            # For now, let's keep removed_passages empty as nothing is removed.
+            pass
 
         train_examples = []
         for item in train_faiss_results[i]:
@@ -227,7 +242,7 @@ def mask_key_entities(text: str, metadata) -> str:
         masked = masked.replace(ent, ENTITY_MASK_TOKEN)
     return masked
 
-def build_contexts_with_mode(retrieved_passages, mode, current_sample_metadata=None, rng=None):
+def build_contexts_with_mode(retrieved_passages, mode, current_sample_metadata=None, rng=None, global_entity_pool=None, distractor_db=None):
     """
     retrieved_passages: list[dict] (retrieved_info)
     mode: str
@@ -251,6 +266,28 @@ def build_contexts_with_mode(retrieved_passages, mode, current_sample_metadata=N
             new_p["db_label"] = mask_key_entities(p["db_label"], current_sample_metadata)
             masked_passages.append(new_p)
         return masked_passages
+
+    if mode == "decoy_replace":
+        if not retrieved_passages:
+            return retrieved_passages
+        
+        # Take the top-1 passage and inject a wrong fact
+        gold_entities = []
+        if isinstance(current_sample_metadata, dict):
+            gold_entities = current_sample_metadata.get("bio_entity", [])
+        elif isinstance(current_sample_metadata, str):
+            if len(current_sample_metadata) < 100:
+                gold_entities = [current_sample_metadata]
+        
+        new_top1 = retrieved_passages[0].copy()
+        new_top1["db_label"] = replace_entity_with_wrong_one(new_top1["db_label"], gold_entities, global_entity_pool, rng)
+        
+        return [new_top1] + retrieved_passages[1:]
+
+    if mode == "decoy_distractor":
+        # choose a distractor snippet from some other protein
+        distractor_text = sample_random_distractor(current_sample_metadata, distractor_db, rng)
+        return add_distractor_passage(retrieved_passages, distractor_text, position="front")
 
     return retrieved_passages
 
@@ -327,6 +364,37 @@ if __name__ == "__main__":
     all_train_features = np.vstack([np.array(all_train_features), np.array(new_all_train_features)])
     all_train_labels = all_train_labels + new_all_train_labels
     
+    # Build global entity pool and distractor DB
+    global_entity_pool = []
+    distractor_db = []
+    
+    for label in all_train_labels:
+        # distractor_db entry
+        # Since all_train_labels contains metadata, we use it for both text and metadata for now
+        # Wait, db_labels passed to RAG_prompt_construction is all_train_labels.
+        # And retrieved_info uses db_label from it.
+        # So the "text" of the passage IS the metadata string/dict?
+        # Let's assume so based on previous analysis.
+        
+        text_content = ""
+        if isinstance(label, dict):
+            # If it's a dict, maybe we should use a specific field?
+            # But RAG_prompt_construction uses item["db_label"] which is this label object.
+            # And the prompt uses it directly.
+            # So we keep the object as is.
+            text_content = str(label) # Fallback for text representation if needed
+            entities = label.get("bio_entity", [])
+            global_entity_pool.extend(entities)
+        elif isinstance(label, str):
+            text_content = label
+            if len(label) < 100:
+                global_entity_pool.append(label)
+        
+        distractor_db.append({'text': label, 'metadata': label}) # Using label as both text and metadata source
+
+    # Deduplicate global entity pool
+    global_entity_pool = list(set(global_entity_pool))
+    
     # print(f"Total training samples after aggregation: {len(all_train_labels)}")
     
     for p in os.listdir(dataset_path):
@@ -354,4 +422,6 @@ if __name__ == "__main__":
                                 task_name=now_task,
                                 topk=top_k,
                                 faiss_index=None,
-                                context_mode=context_mode)
+                                context_mode=context_mode,
+                                global_entity_pool=global_entity_pool,
+                                distractor_db=distractor_db)
